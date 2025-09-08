@@ -1,0 +1,697 @@
+# -*- coding: utf-8 -*-
+"""
+PhaseNet 2.0 (Dense-UNet) — ToF 단일 주파수 페이즈 언랩핑(k-분류 + 잔차 없는 단순 복원)
+요청 반영 사항:
+  • PSNR/시각화 최대 깊이 상한을 '항상' 8400 mm로 고정(공정 비교용)
+  • 회귀 코드처럼 컬러바 포함 RGB 시각화(입력/GT/Pred/AbsErr) + Pred 16-bit(mm) 저장
+그 외 학습/평가 로직은 기존 흐름 유지.
+
+Windows + RTX 5080 + torch 2.8.0+cu129 가정
+"""
+
+import os, math, time, json, random, datetime
+from pathlib import Path
+from typing import List, Tuple, Dict
+
+# (윈도우 OpenMP 런타임 경고 임시 완화)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# 16-bit PNG 입출력(imageio 권장)
+try:
+    import imageio.v3 as iio
+except Exception:
+    iio = None
+    from PIL import Image as _PIL_Image
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from PIL import Image
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0) CONFIG: 경로/하이퍼파라미터
+# ─────────────────────────────────────────────────────────────────────────────
+# ▶ 여기 3곳만 로컬 경로에 맞게 수정하세요.
+WRAPPED_DIR = Path(r"C:\Users\ADMIN\Desktop\wr")   # 입력(랩핑) 1채널 16-bit PNG(mm)
+GT_DIR      = Path(r"C:\Users\ADMIN\Desktop\un") # GT(언랩)   1채널 16-bit PNG(mm)
+SAVE_ROOT   = Path(r"C:\Users\ADMIN\Desktop\save")              # 결과 루트
+
+# 물리/정규화 파라미터
+R_IN_MM      = 1250.0                 
+PSNR_MAX_MM  = 8300.0                
+
+# 학습 파라미터(기존 유지)
+INPUT_SIZE      = 256
+BATCH_SIZE      = 4
+NUM_EPOCHS      = 100
+LEARNING_RATE   = 1e-3
+WEIGHT_DECAY    = 1e-6
+VAL_RATIO       = 0.10
+TEST_RATIO      = 0.10
+
+# 손실 가중치(기존 유지)
+LAMBDA_L1       = 1.0
+LAMBDA_RESIDUE  = 0.1
+
+# 기타 설정
+SEED                    = 42
+NUM_WORKERS             = 0     
+PIN_MEMORY              = True
+AMP_ENABLE              = True  
+TREAT_ZERO_AS_INVALID   = True
+MAX_SAVE_VIZ_PER_SPLIT  = 6
+SAVE_K_HISTOGRAM        = True
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) 유틸/수학 함수
+# ─────────────────────────────────────────────────────────────────────────────
+def set_seed(seed: int = 42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def now_tag():
+    return datetime.datetime.now().strftime('%m-%d-%H-%M-%S')
+
+def ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+
+def read_png_u16(path: Path) -> np.ndarray:
+    """16-bit PNG(mm) → np.uint16"""
+    if iio is not None:
+        arr = iio.imread(path.as_posix())
+        if arr.dtype != np.uint16:
+            arr = arr.astype(np.uint16)
+        return arr
+    else:
+        return np.array(_PIL_Image.open(path.as_posix()), dtype=np.uint16)
+
+def write_png_u16(path: Path, arr_mm: np.ndarray):
+    arr = np.clip(arr_mm, 0, 65535).astype(np.uint16)
+    if iio is not None:
+        iio.imwrite(path.as_posix(), arr)
+    else:
+        _PIL_Image.fromarray(arr).save(path.as_posix())
+
+def depth_to_phase(depth_mm: torch.Tensor, R_mm: float) -> torch.Tensor:
+    """d(mm) → φ(rad) = 2π * d / R"""
+    return (2.0 * math.pi) * (depth_mm / R_mm)
+
+def wrap_phase(phi: torch.Tensor) -> torch.Tensor:
+    """wrap(φ) ∈ (-π, π]"""
+    return torch.atan2(torch.sin(phi), torch.cos(phi))
+
+def finite_diff_xy(x: torch.Tensor):
+    """1차 차분 ∂x, ∂y"""
+    dx = x[:, :, :, 1:] - x[:, :, :, :-1]
+    dy = x[:, :, 1:, :] - x[:, :, :-1, :]
+    dx = F.pad(dx, (0,1,0,0), mode='replicate')
+    dy = F.pad(dy, (0,0,0,1), mode='replicate')
+    return dx, dy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) 파일 매칭/분할/통계
+# ─────────────────────────────────────────────────────────────────────────────
+def match_pairs(wdir: Path, gdir: Path) -> List[Tuple[Path, Path, str]]:
+    wlist = sorted([p for p in wdir.glob('*.png')])
+    glist = sorted([p for p in gdir.glob('*.png')])
+    wmap = {p.stem: p for p in wlist}
+    gmap = {p.stem: p for p in glist}
+    common = sorted(set(wmap.keys()) & set(gmap.keys()))
+    pairs = []
+    if len(common) >= max(len(wlist), len(glist)) * 0.8:
+        for s in common:
+            pairs.append((wmap[s], gmap[s], s))
+    else:
+        n = min(len(wlist), len(glist))
+        for i in range(n):
+            pairs.append((wlist[i], glist[i], wlist[i].stem))
+        if abs(len(wlist)-len(glist)) > 0:
+            print("[WARN] filename match low. used index matching.")
+    return pairs
+
+def split_indices(n: int, val_ratio: float, test_ratio: float, seed: int):
+    idx = list(range(n))
+    rng = random.Random(seed); rng.shuffle(idx)
+    n_test = int(round(n * test_ratio))
+    n_val  = int(round(n * val_ratio))
+    n_train = n - n_val - n_test
+    return idx[:n_train], idx[n_train:n_train+n_val], idx[n_train+n_val:]
+
+def compute_dataset_max_depth(pairs: List[Tuple[Path, Path, str]]) -> int:
+    m = 0
+    for _, gt, _ in pairs:
+        arr = read_png_u16(gt)
+        valid = arr[(arr != 65535) & (arr >= 0)]
+        if valid.size > 0:
+            m = max(m, int(valid.max()))
+    return max(m, 1)
+
+def compute_depth_percentile(pairs: List[Tuple[Path, Path, str]], p=95) -> float:
+    vals = []
+    for _, gt, _ in pairs:
+        arr = read_png_u16(gt)
+        v = arr[(arr != 65535) & (arr >= 0)]
+        if v.size > 0:
+            vals.append(np.percentile(v, p))
+    return float(np.max(vals)) if vals else 1.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) Dataset
+# ─────────────────────────────────────────────────────────────────────────────
+class ToFPairsDataset(Dataset):
+    """
+    반환:
+      in_depth_mm[1,H,W], gt_depth_mm[1,H,W], valid_mask[1,H,W](bool),
+      psi_in[1,H,W], phi_gt_inR[1,H,W], k_gt[H,W](long), stem(str), class_vals[C]
+    """
+    def __init__(self, pairs, R_in_mm: float, K_max: int,
+                 input_size: int = 256, treat_zero_invalid: bool = True,
+                 augment: bool = False):
+        self.pairs = pairs
+        self.R_in = R_in_mm
+        self.K_max = int(K_max)
+        self.C = 2*self.K_max + 1
+        self.input_size = input_size
+        self.treat_zero_invalid = treat_zero_invalid
+        self.augment = augment
+        self.class_vals = torch.arange(-self.K_max, self.K_max+1, dtype=torch.float32)
+
+    def __len__(self): return len(self.pairs)
+
+    def _to_tensor(self, arr_u16: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(arr_u16.astype(np.float32)).unsqueeze(0)  # [1,H,W]
+
+    def _resize_if_needed(self, t: torch.Tensor) -> torch.Tensor:
+        if t.shape[-1] == self.input_size and t.shape[-2] == self.input_size:
+            return t
+        return F.interpolate(t.unsqueeze(0), size=(self.input_size, self.input_size),
+                             mode="bilinear", align_corners=False).squeeze(0)
+
+    def _resize_mask_nearest(self, m: torch.Tensor) -> torch.Tensor:
+        if m.shape[-1] == self.input_size and m.shape[-2] == self.input_size:
+            return m
+        m = F.interpolate(m.float().unsqueeze(0), size=(self.input_size, self.input_size),
+                          mode="nearest").squeeze(0)
+        return m.bool()
+
+    def __getitem__(self, idx):
+        wpath, gpath, stem = self.pairs[idx]
+        in_u16 = read_png_u16(wpath); gt_u16 = read_png_u16(gpath)
+        in_t = self._to_tensor(in_u16)  # mm
+        gt_t = self._to_tensor(gt_u16)  # mm
+
+        valid = (in_t != 65535) & (gt_t != 65535)
+        if TREAT_ZERO_AS_INVALID:
+            valid = valid & (in_t > 0) & (gt_t > 0)
+
+        in_t = self._resize_if_needed(in_t)
+        gt_t = self._resize_if_needed(gt_t)
+        valid = self._resize_mask_nearest(valid)
+
+        phi_in = depth_to_phase(in_t, self.R_in)
+        psi_in = wrap_phase(phi_in)
+        phi_gt_inR = depth_to_phase(gt_t, self.R_in)  # GT도 R_in 기준으로 변환
+
+        # k_gt = round((φ_gt - ψ_in)/2π), [-K..K]로 클램프
+        k_gt = torch.round((phi_gt_inR - psi_in) / (2.0*math.pi)).squeeze(0)
+        k_gt = k_gt.clamp(min=-self.K_max, max=self.K_max).long()
+
+        # 간단 증강
+        if self.augment:
+            if random.random() < 0.5:
+                in_t = torch.flip(in_t, [2]); gt_t = torch.flip(gt_t, [2])
+                valid = torch.flip(valid, [2]); psi_in = torch.flip(psi_in, [2])
+                phi_gt_inR = torch.flip(phi_gt_inR, [2]); k_gt = torch.flip(k_gt, [1])
+            if random.random() < 0.5:
+                in_t = torch.flip(in_t, [1]); gt_t = torch.flip(gt_t, [1])
+                valid = torch.flip(valid, [1]); psi_in = torch.flip(psi_in, [1])
+                phi_gt_inR = torch.flip(phi_gt_inR, [1]); k_gt = torch.flip(k_gt, [0])
+
+        return {
+            "in_depth_mm": in_t, "gt_depth_mm": gt_t, "valid_mask": valid,
+            "psi_in": psi_in, "phi_gt_inR": phi_gt_inR, "k_gt": k_gt,
+            "stem": stem, "class_vals": self.class_vals,
+        }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) 모델 (Dense-UNet/Tiramisu 간소화)
+# ─────────────────────────────────────────────────────────────────────────────
+class ResidualBlock(nn.Module):
+    """Conv-BN-ReLU-Conv-BN + skip. 채널/stride 안맞으면 1×1로 skip 정렬."""
+    def __init__(self, ci, co, stride=1, norm='bn', act='relu'):
+        super().__init__()
+        Norm = nn.BatchNorm2d if norm == 'bn' else nn.InstanceNorm2d
+        self.conv1 = nn.Conv2d(ci, co, 3, stride=stride, padding=1, bias=False)
+        self.n1    = Norm(co)
+        self.conv2 = nn.Conv2d(co, co, 3, stride=1, padding=1, bias=False)
+        self.n2    = Norm(co)
+        self.act   = nn.ReLU(inplace=True) if act == 'relu' else nn.LeakyReLU(0.1, inplace=True)
+        self.skip  = nn.Identity() if (ci == co and stride == 1) else nn.Conv2d(ci, co, 1, stride=stride, bias=False)
+
+    def forward(self, x):
+        y = self.act(self.n1(self.conv1(x)))
+        y = self.n2(self.conv2(y))
+        s = self.skip(x)
+        return self.act(y + s)
+
+class UpBlock(nn.Module):
+    """2× 업샘플(C.Transpose) → concat(skip) → ResidualBlock"""
+    def __init__(self, ci, co, norm='bn', act='relu'):
+        super().__init__()
+        self.up   = nn.ConvTranspose2d(ci, co, 2, stride=2)
+        self.conv = ResidualBlock(ci=co*2, co=co, stride=1, norm=norm, act=act)  # concat 후 채널=co*2
+    def forward(self, x, skip):
+        x = self.up(x)
+        # 홀/짝 해상도에서 1픽셀 차이 보정
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+class PhaseNetResUNet(nn.Module):
+    """
+    PhaseNet 분류용 Res-UNet
+      - in_ch: 입력 채널(깊이 1채널이면 1)
+      - base_ch: stem 채널(기본 48; 메모리 여유 없으면 32)
+      - num_classes: C (=-K..K의 개수)
+    """
+    def __init__(self, in_ch: int, num_classes: int, base_ch: int = 48,
+                 norm: str = 'bn', act: str = 'relu'):
+        super().__init__()
+        c1 = base_ch         # 48
+        c2 = base_ch * 2     # 96
+        c3 = base_ch * 4     # 192
+        cb = base_ch * 8     # 384
+
+        # Encoder
+        self.enc1 = ResidualBlock(in_ch, c1, stride=1, norm=norm, act=act)  # /1
+        self.down1= ResidualBlock(c1, c2, stride=2, norm=norm, act=act)     # /2
+        self.enc2 = ResidualBlock(c2, c2, stride=1, norm=norm, act=act)     # /2
+        self.down2= ResidualBlock(c2, c3, stride=2, norm=norm, act=act)     # /4
+
+        # Bottleneck(한 번 더 다운해 수용영역 확장)
+        self.bott = ResidualBlock(c3, cb, stride=2, norm=norm, act=act)     # /8
+
+        # Decoder
+        self.up2  = UpBlock(cb, c3, norm=norm, act=act)   # /4
+        self.up1  = UpBlock(c3, c2, norm=norm, act=act)   # /2
+        self.up0  = nn.ConvTranspose2d(c2, c1, 2, stride=2)  # /1
+        self.dec0 = ResidualBlock(c1, c1, stride=1, norm=norm, act=act)
+
+        # Classification head: C-way logits
+        self.head_k = nn.Conv2d(c1, num_classes, 1)
+
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)        # [B, c1, H,   W  ]
+        d1 = self.down1(e1)      # [B, c2, H/2, W/2]
+        e2 = self.enc2(d1)       # [B, c2, H/2, W/2]
+        d2 = self.down2(e2)      # [B, c3, H/4, W/4]
+
+        b  = self.bott(d2)       # [B, cb, H/8, W/8]
+
+        # Decoder
+        u2 = self.up2(b,  d2)    # [B, c3, H/4, W/4]
+        u1 = self.up1(u2, e2)    # [B, c2, H/2, W/2]
+        u0 = self.up0(u1)        # [B, c1, H,   W  ]
+        if u0.shape[-2:] != e1.shape[-2:]:
+            u0 = F.interpolate(u0, size=e1.shape[-2:], mode='bilinear', align_corners=False)
+        z  = self.dec0(u0 + e1)  # 마지막에도 residual 결합으로 안정화
+
+        logits = self.head_k(z)  # [B, C, H, W]
+        return logits
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) 손실/지표
+# ─────────────────────────────────────────────────────────────────────────────
+def masked_ce_loss(logits, target, valid_mask, class_weight=None, label_smoothing=0.05):
+    """
+    유효 픽셀만 CE + 라벨 스무딩(초기 붕괴/불균형 완화)
+    logits:[B,C,H,W], target:[B,H,W], valid_mask:[B,1,H,W]
+    """
+    loss_map = F.cross_entropy(
+        logits, target,
+        weight=class_weight,
+        reduction='none',
+        label_smoothing=label_smoothing
+    )  # [B,H,W]
+    m = valid_mask.squeeze(1)  # [B,H,W]
+    loss = loss_map[m]
+    return loss.mean() if loss.numel() > 0 else logits.sum()*0
+
+def phase_l1_and_residue(psi_in, phi_gt_inR, prob, class_vals, valid_mask):
+    """φ̃_soft = ψ + 2π E[k] → L1(φ̃, φ_gt) + Residue(∇φ̃, ∇φ_gt)"""
+    B, C, H, W = prob.shape
+    cv = class_vals.view(1, C, 1, 1).to(prob.device)
+    k_exp = (prob * cv).sum(dim=1, keepdim=True)
+    phi_tilde = psi_in + (2.0*math.pi)*k_exp
+
+    l1 = (phi_tilde - phi_gt_inR).abs()
+    l1 = l1[valid_mask].mean() if valid_mask.any() else phi_tilde.sum()*0
+
+    dx1, dy1 = finite_diff_xy(phi_tilde)
+    dx2, dy2 = finite_diff_xy(phi_gt_inR)
+    res = (dx1 - dx2).abs() + (dy1 - dy2).abs()
+    res = res[valid_mask].mean() if valid_mask.any() else phi_tilde.sum()*0
+    return l1, res
+
+def depth_metrics_mm(pred_mm: torch.Tensor, gt_mm: torch.Tensor, valid_mask: torch.Tensor) -> Dict[str,float]:
+    """MAE/RMSE/PSNR(mm). ★ PSNR peak은 항상 PSNR_MAX_MM(=8400)으로 고정 ★"""
+    with torch.no_grad():
+        v = valid_mask
+        if v.sum() == 0:
+            return {"MAE":0.0, "RMSE":0.0, "PSNR":0.0}
+        e = (pred_mm - gt_mm)[v]
+        mae = e.abs().mean().item()
+        mse = (e**2).mean().item()
+        rmse = math.sqrt(mse + 1e-12)
+        peak = max(1.0, float(PSNR_MAX_MM))
+        psnr = 20.0*math.log10(peak / max(1e-6, rmse))
+    return {"MAE":mae, "RMSE":rmse, "PSNR":psnr}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) 클래스 가중치(불균형 완화)
+# ─────────────────────────────────────────────────────────────────────────────
+def estimate_class_weight(loader, num_classes: int) -> torch.Tensor:
+    hist = torch.zeros(num_classes, dtype=torch.float64)
+    for batch in loader:
+        k = batch["k_gt"]  # [-K..K]
+        k_idx = (k + num_classes//2).clamp(0, num_classes-1)
+        for c in range(num_classes):
+            hist[c] += (k_idx == c).sum().item()
+    hist = hist + 1.0  # 라플라스 스무딩
+    freq = hist / hist.sum()
+    w = 1.0 / (freq + 1e-8)
+    w = w / w.mean()
+    return w.clamp(0.2, 5.0).float()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7) 회귀 코드 스타일 시각화(컬러바 포함 RGB) + 16-bit 저장
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _to_numpy_hw(t: torch.Tensor) -> np.ndarray:
+    if isinstance(t, torch.Tensor):
+        t = t.detach().float().cpu()
+        if t.ndim == 4: t = t[0,0]
+        elif t.ndim == 3: t = t[0]
+    return t.numpy()
+
+def _save_with_colorbar(path: Path, mm_hw: np.ndarray, vmin_mm: float, vmax_mm: float, title: str, cmap: str = "jet"):
+    h, w = mm_hw.shape
+    fig = plt.figure(figsize=(w/200, h/200), dpi=200)
+    ax  = plt.axes([0.00, 0.00, 0.85, 1.00])
+    im  = ax.imshow(np.clip(mm_hw, vmin_mm, vmax_mm), cmap=cmap, vmin=vmin_mm, vmax=vmax_mm)
+    ax.set_axis_off()
+    cax = plt.axes([0.86, 0.05, 0.04, 0.90])
+    cb  = plt.colorbar(im, cax=cax); cb.set_label("Depth (mm)")
+    plt.suptitle(title, fontsize=8, y=0.99)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path.as_posix(), dpi=200, bbox_inches="tight", pad_inches=0.0)
+    plt.close(fig)
+
+def save_visuals(batch, logits, save_dir: Path, split_tag: str, class_vals, R_in_mm: float, limit: int = 12):
+    """
+    기존 save_visuals를 대체: jet+colorbar RGB + 16-bit(mm)
+    저장 파일:
+      *_in_wrapped_rgb_jet.png   (0..R_in_mm)
+      *_gt_depth_rgb_jet.png     (0..PSNR_MAX_MM)
+      *_pred_depth_rgb_jet.png   (0..PSNR_MAX_MM)
+      *_error_mm_rgb_jet.png     (0..p99 or 1.0)
+      *_pred_depth_mm_u16.png    (16-bit mm)
+      *_kmap.png                 (k_gt/k_pred 팔레트)
+    """
+    save_dir = Path(save_dir); ensure_dir(save_dir)
+    B, C = logits.shape[0], logits.shape[1]
+    cv = class_vals.view(1, C, 1, 1).to(logits.device)
+    prob = logits.softmax(dim=1)
+    k_exp = (prob * cv).sum(dim=1, keepdim=True)
+    k_arg = logits.argmax(dim=1, keepdim=True).float() - (C//2)
+
+    psi = batch["psi_in"].to(logits.device)
+    gt  = batch["gt_depth_mm"].to(logits.device)
+    valid = batch["valid_mask"].to(logits.device)
+    stem = batch["stem"]
+
+    phi_tilde = psi + (2.0*math.pi)*k_arg
+    pred_mm = (phi_tilde * (R_in_mm / (2.0*math.pi))).clamp(min=0.0)
+    k_gt = batch["k_gt"].to(logits.device).float()
+
+    Kmax = (C//2)
+    base = plt.get_cmap('tab20').colors
+    pal = ListedColormap([base[(k+1000)%len(base)] for k in range(-Kmax, Kmax+1)])
+
+    for i in range(min(B, limit)):
+        name = stem[i]
+        in_mm  = batch["in_depth_mm"][i,0].cpu().numpy()
+        gt_mm  = gt[i,0].detach().cpu().numpy()
+        pd_mm  = pred_mm[i,0].detach().cpu().numpy()
+        km_gt  = (k_gt[i]).detach().cpu().numpy()
+        km_pr  = (k_arg[i,0]).detach().cpu().numpy()
+
+        # RGB with colorbar
+        _save_with_colorbar(save_dir / f"{split_tag}_{name}_in_wrapped_rgb_jet.png", in_mm, 0.0, float(R_in_mm), f"{name} • In(wrapped)")
+        _save_with_colorbar(save_dir / f"{split_tag}_{name}_gt_depth_rgb_jet.png",   gt_mm, 0.0, float(PSNR_MAX_MM), f"{name} • GT")
+        _save_with_colorbar(save_dir / f"{split_tag}_{name}_pred_depth_rgb_jet.png", pd_mm, 0.0, float(PSNR_MAX_MM), f"{name} • Pred")
+
+        err = np.abs(pd_mm - gt_mm)
+        emax = float(np.percentile(err, 99.0)) if np.any(err>0) else 1.0
+        _save_with_colorbar(save_dir / f"{split_tag}_{name}_error_mm_rgb_jet.png", err, 0.0, max(1.0, emax), f"{name} • AbsErr")
+
+        # 16-bit(mm)
+        write_png_u16(save_dir / f"{split_tag}_{name}_pred_depth_mm_u16.png", pd_mm.astype(np.uint16))
+
+        # k-map
+        plt.figure(figsize=(8,3))
+        plt.subplot(1,2,1); plt.title("k_gt");   plt.axis('off'); plt.imshow(km_gt, cmap=pal, vmin=-Kmax, vmax=+Kmax)
+        plt.subplot(1,2,2); plt.title("k_pred"); plt.axis('off'); plt.imshow(km_pr, cmap=pal, vmin=-Kmax, vmax=+Kmax)
+        plt.tight_layout(); plt.savefig(save_dir / f"{split_tag}_{name}_kmap.png", dpi=150); plt.close()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8) 학습/평가 루프
+# ─────────────────────────────────────────────────────────────────────────────
+
+def train_one_epoch(model, loader, opt, scaler, class_weight, class_vals, epoch: int):
+    model.train()
+    t0 = time.time()
+    logs = {"ce":0.0,"l1":0.0,"res":0.0,"tot":0.0,"kacc":0.0,"k±1":0.0,"MAE":0.0,"RMSE":0.0,"PSNR":0.0}
+    nstep=0
+    for batch in loader:
+        in_mm  = batch["in_depth_mm"].to(DEVICE)
+        gt_mm  = batch["gt_depth_mm"].to(DEVICE)
+        valid  = batch["valid_mask"].to(DEVICE).bool()
+        psi    = batch["psi_in"].to(DEVICE)
+        phi_gt = batch["phi_gt_inR"].to(DEVICE)
+
+        # k_gt 준비
+        k_gt_raw = batch["k_gt"].to(DEVICE)                 # [-K..K] (히스토용)
+        k_gt     = k_gt_raw + (class_vals.numel()//2)        # [0..C-1]
+        k_gt     = k_gt.clamp(0, class_vals.numel()-1)
+
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast('cuda', enabled=AMP_ENABLE):
+            logits = model(in_mm)                            # [B,C,H,W]
+            prob   = logits.softmax(dim=1)
+            use_weight = (epoch >= 3)
+            ce = masked_ce_loss(
+                logits, k_gt, valid,
+                class_weight if use_weight else None,
+                label_smoothing=0.05 if use_weight else 0.10
+            )
+            l1, res = phase_l1_and_residue(psi, phi_gt, prob, class_vals, valid)
+            loss = ce + LAMBDA_L1*l1 + LAMBDA_RESIDUE*res
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(opt); scaler.update()
+
+        with torch.no_grad():
+            logs["ce"]  += ce.item(); logs["l1"] += l1.item(); logs["res"] += res.item(); logs["tot"] += loss.item()
+
+            # 분류 지표
+            pred_index = logits.argmax(dim=1)
+            kacc_exact = (pred_index == k_gt).float().mean().item()
+            pred_k = pred_index.float() - (class_vals.numel()//2)
+            kacc_within1 = ((pred_k - k_gt_raw.float()).abs() <= 1).float().mean().item()
+            logs["kacc"] += kacc_exact; logs["k±1"] += kacc_within1
+
+            # 깊이 지표(PSNR peak=8400 고정)
+            k_arg = pred_k.unsqueeze(1)
+            phi_t = psi + (2.0*math.pi)*k_arg
+            pred_mm = (phi_t * (R_IN_MM / (2.0*math.pi))).clamp(min=0.0)
+            m = depth_metrics_mm(pred_mm, gt_mm, valid)
+            logs["MAE"] += m["MAE"]; logs["RMSE"] += m["RMSE"]; logs["PSNR"] += m["PSNR"]
+            nstep += 1
+
+    for k in logs: logs[k] = logs[k] / max(1, nstep)
+    logs["time"] = time.time() - t0
+    print(f"[Train {epoch:03d}] L={logs['tot']:.4f}, CE={logs['ce']:.4f}, L1={logs['l1']:.4f}, Res={logs['res']:.4f} | "
+          f"Kacc={logs['kacc']:.3f}, K±1={logs['k±1']:.3f} | MAE={logs['MAE']:.2f}mm, RMSE={logs['RMSE']:.2f}, PSNR={logs['PSNR']:.2f} dB")
+    return logs
+
+@torch.no_grad()
+def evaluate(model, loader, class_vals, epoch: int, tag: str, save_samples: bool = False, limit: int = 6):
+    model.eval()
+    logs = {"ce":0.0,"l1":0.0,"res":0.0,"tot":0.0,"kacc":0.0,"k±1":0.0,"MAE":0.0,"RMSE":0.0,"PSNR":0.0}
+    nstep=0; saved=0
+    for batch in loader:
+        in_mm  = batch["in_depth_mm"].to(DEVICE)
+        gt_mm  = batch["gt_depth_mm"].to(DEVICE)
+        valid  = batch["valid_mask"].to(DEVICE).bool()
+        psi    = batch["psi_in"].to(DEVICE)
+        phi_gt = batch["phi_gt_inR"].to(DEVICE)
+
+        logits = model(in_mm)
+        prob   = logits.softmax(dim=1)
+        ce = masked_ce_loss(logits, (batch["k_gt"].to(DEVICE) + (class_vals.numel()//2)).clamp(0, class_vals.numel()-1), valid, None)
+        l1, res = phase_l1_and_residue(psi, phi_gt, prob, class_vals, valid)
+        loss = ce + LAMBDA_L1*l1 + LAMBDA_RESIDUE*res
+
+        logs["ce"] += ce.item(); logs["l1"] += l1.item(); logs["res"] += res.item(); logs["tot"] += loss.item()
+
+        pred_index = logits.argmax(dim=1)
+        kacc_exact = (pred_index == (batch["k_gt"].to(DEVICE) + (class_vals.numel()//2)).clamp(0, class_vals.numel()-1)).float().mean().item()
+        pred_k = pred_index.float() - (class_vals.numel()//2)
+        kacc_within1 = ((pred_k - batch["k_gt"].to(DEVICE).float()).abs() <= 1).float().mean().item()
+        logs["kacc"]+= kacc_exact; logs["k±1"] += kacc_within1
+
+        k_arg = pred_k.unsqueeze(1)
+        phi_t = psi + (2.0*math.pi)*k_arg
+        pred_mm = (phi_t * (R_IN_MM / (2.0*math.pi))).clamp(min=0.0)
+        m = depth_metrics_mm(pred_mm, gt_mm, valid)
+        logs["MAE"] += m["MAE"]; logs["RMSE"] += m["RMSE"]; logs["PSNR"] += m["PSNR"]
+        nstep += 1
+
+        if save_samples and saved < limit:
+            save_visuals(batch, logits, SUB["viz"], f"{tag.lower()}_ep{epoch:03d}", class_vals, R_IN_MM, limit=limit)
+            saved += in_mm.size(0)
+
+    for k in logs: logs[k] = logs[k] / max(1, nstep)
+    print(f"[{tag} {epoch:03d}] L={logs['tot']:.4f}, CE={logs['ce']:.4f}, L1={logs['l1']:.4f}, Res={logs['res']:.4f} | "
+          f"Kacc={logs['kacc']:.3f}, K±1={logs['k±1']:.3f} | MAE={logs['MAE']:.2f}mm, RMSE={logs['RMSE']:.2f}, PSNR={logs['PSNR']:.2f} dB")
+    return logs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9) main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    global SUB
+    set_seed(SEED)
+    torch.backends.cudnn.benchmark = True
+
+    RUN_ROOT = SAVE_ROOT / f"run_{now_tag()}"
+    SUB = {"ckpt": RUN_ROOT/"checkpoints", "viz": RUN_ROOT/"viz", "pred": RUN_ROOT/"pred_depth_mm", "logs": RUN_ROOT/"logs"}
+    for p in SUB.values(): ensure_dir(p)
+
+    print(f"[INFO] DEVICE={DEVICE}, torch={torch.__version__}")
+    print(f"[PATH] WRAPPED_DIR={WRAPPED_DIR}")
+    print(f"[PATH] GT_DIR     ={GT_DIR}")
+    print(f"[PATH] SAVE_ROOT  ={SAVE_ROOT}")
+
+    # 페어/분할
+    pairs = match_pairs(WRAPPED_DIR, GT_DIR)
+    assert len(pairs) > 0, "No matched input/gt PNG files."
+    print(f"[INFO] total pairs = {len(pairs)}")
+
+    # K_max(classes) 산정: p95 기반(보수)
+    max_depth_mm = compute_dataset_max_depth(pairs)
+    p95_depth_mm = compute_depth_percentile(pairs, p=95)
+    K_max_full = int(math.floor(max_depth_mm / R_IN_MM))
+    K_max_p95  = int(math.floor(p95_depth_mm / R_IN_MM))
+    K_max = max(1, min(K_max_full, K_max_p95))
+    C = 2*K_max + 1
+    print(f"[INFO] max_depth={max_depth_mm} mm, p95={p95_depth_mm:.1f} mm → K_max={K_max}, classes(C)={C}")
+    print(f"[INFO] PSNR/Colorbar MAX fixed = {PSNR_MAX_MM} mm")
+
+    tr_idx, va_idx, te_idx = split_indices(len(pairs), VAL_RATIO, TEST_RATIO, SEED)
+    pairs_train = [pairs[i] for i in tr_idx]
+    pairs_val   = [pairs[i] for i in va_idx]
+    pairs_test  = [pairs[i] for i in te_idx]
+    print(f"[INFO] split: train={len(pairs_train)}, val={len(pairs_val)}, test={len(pairs_test)}")
+
+    # Dataset/Loader
+    ds_train = ToFPairsDataset(pairs_train, R_IN_MM, K_max, INPUT_SIZE, TREAT_ZERO_AS_INVALID, augment=True)
+    ds_val   = ToFPairsDataset(pairs_val,   R_IN_MM, K_max, INPUT_SIZE, TREAT_ZERO_AS_INVALID, augment=False)
+    ds_test  = ToFPairsDataset(pairs_test,  R_IN_MM, K_max, INPUT_SIZE, TREAT_ZERO_AS_INVALID, augment=False)
+
+    dl_train = DataLoader(ds_train, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+    dl_val   = DataLoader(ds_val,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+    dl_test  = DataLoader(ds_test,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+
+    # 클래스 가중치 추정
+    class_weight = estimate_class_weight(dl_train, C).to(DEVICE)
+    if SAVE_K_HISTOGRAM:
+        with open(SUB["logs"]/ "class_weight.json", "w", encoding="utf-8") as f:
+            json.dump({"class_weight": class_weight.cpu().tolist()}, f, indent=2, ensure_ascii=False)
+
+    # 모델/최적화/스케일러/스케줄러
+    model = PhaseNetResUNet(
+    in_ch=1,
+    num_classes=C,
+    base_ch=48,   # 메모리 여유 없으면 32, 더 강하게 64
+    norm='bn',
+    act='relu'
+).to(DEVICE)
+    opt   = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scaler= torch.amp.GradScaler('cuda', enabled=AMP_ENABLE)
+    sch   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=NUM_EPOCHS)
+
+    class_vals = ds_train.class_vals.to(DEVICE)
+
+    # 학습
+    best_val = float('inf'); best_ckpt = SUB["ckpt"]/ "best.pth"
+    logs_all = {"train":[], "val":[], "test":None, "config":{
+        "R_IN_MM":R_IN_MM, "PSNR_MAX_MM":PSNR_MAX_MM, "K_max":K_max, "C":C,
+        "INPUT_SIZE":INPUT_SIZE, "BATCH_SIZE":BATCH_SIZE, "EPOCHS":NUM_EPOCHS,
+        "LAMBDA_L1":LAMBDA_L1, "LAMBDA_RESIDUE":LAMBDA_RESIDUE,
+        "TREAT_ZERO_AS_INVALID":TREAT_ZERO_AS_INVALID
+    }}
+
+    for epoch in range(1, NUM_EPOCHS+1):
+        tr = train_one_epoch(model, dl_train, opt, scaler, class_weight, class_vals, epoch)
+        va = evaluate(model, dl_val, class_vals, epoch, tag="Val", save_samples=(epoch==1 or epoch%5==0), limit=6)
+        sch.step()
+
+        logs_all["train"].append(tr); logs_all["val"].append(va)
+
+        if va["MAE"] < best_val:
+            best_val = va["MAE"]
+            torch.save({"epoch":epoch, "state_dict":model.state_dict(), "K_max":K_max, "C":C}, best_ckpt)
+            print(f"[SAVE] best checkpoint @ epoch {epoch} (MAE={best_val:.2f} mm)")
+
+        with open(SUB["logs"]/ "logs.json", "w", encoding="utf-8") as f:
+            json.dump(logs_all, f, indent=2, ensure_ascii=False)
+
+    # 테스트
+    ck = torch.load(best_ckpt, map_location=DEVICE)
+    model.load_state_dict(ck["state_dict"])
+    print(f"[INFO] loaded best ckpt from epoch {ck['epoch']}")
+
+    te = evaluate(model, dl_test, class_vals, epoch=ck["epoch"], tag="Test", save_samples=True, limit=MAX_SAVE_VIZ_PER_SPLIT)
+    logs_all["test"] = te
+    with open(SUB["logs"]/ "logs.json", "w", encoding="utf-8") as f:
+        json.dump(logs_all, f, indent=2, ensure_ascii=False)
+
+    # 테스트 배치 시각화(추가 저장)
+    for batch in dl_test:
+        logits = model(batch["in_depth_mm"].to(DEVICE))
+        save_visuals(batch, logits, SUB["viz"], "test_final", class_vals, R_IN_MM, limit=MAX_SAVE_VIZ_PER_SPLIT)
+        break
+
+    print(f"[DONE] Results saved to: {RUN_ROOT}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    main()
