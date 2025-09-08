@@ -1,0 +1,569 @@
+# -*-# -*- coding: utf-8 -*-
+"""
+ToF 단일 주파수 페이즈 언랩핑 (회귀: Dense-UNet)
+- 손실/네트워크/전처리는 기존 회귀 코드 그대로 유지
+- 시각화/저장만 PhaseNet 2.0 스타일로 통일:
+  viz:  *_in_wrapped_rgb.png / *_gt_depth_rgb.png / *_pred_depth_rgb.png / *_error_mm_rgb.png
+  pred: *_pred_depth_mm_u16.png (16-bit 수치 보존)
+"""
+
+from __future__ import annotations
+import os, math, time, random, datetime, json
+from pathlib import Path
+from typing import Tuple, List, Dict
+
+# (선택) Windows OpenMP 충돌 임시 우회 — OMP Error #15 예방용
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import numpy as np
+import imageio.v3 as iio
+
+import matplotlib
+matplotlib.use("Agg")   # GUI 없이 저장만
+from matplotlib import pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0) 경로/환경/하이퍼파라미터
+# ─────────────────────────────────────────────────────────────────────────────
+ROOT_DIR      = r"C:\Users\ADMIN\Desktop"        # 데이터 루트
+INPUT_DIR     = Path(ROOT_DIR) / "wr"            # 입력(랩핑 깊이, mm)
+GT_DIR        = Path(ROOT_DIR) / "un"            # GT(절대 깊이, mm)
+SAVE_ROOT     = Path(ROOT_DIR) / "save"          # 결과 루트
+
+INPUT_SIZE    = 256
+BATCH_SIZE    = 4
+EPOCHS        = 100
+LR            = 1e-3
+WEIGHT_DECAY  = 1e-6
+
+MAX_DEPTH_MM  = 8300.0        # 정규화/시각화 상한(mm)
+AMBIG_MM      = 1250.0         # 랩 주기(mm) — Cycle Loss용
+
+NUM_WORKERS   = 4
+SEED          = 42
+VAL_SPLIT     = 0.2
+
+DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) 유틸
+# ─────────────────────────────────────────────────────────────────────────────
+def set_seed(seed: int = 42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def now_tag():
+    return datetime.datetime.now().strftime('%m-%d-%H-%M-%S')
+
+def mm_to_norm(x_mm: torch.Tensor) -> torch.Tensor:
+    """[0,1] 정규화 (mm → norm). 손실 수치 안정화."""
+    return torch.clamp(x_mm / MAX_DEPTH_MM, 0.0, 1.0)
+
+def norm_to_mm(x_norm: torch.Tensor) -> torch.Tensor:
+    """정규화 역변환 (norm → mm)."""
+    return torch.clamp(x_norm, 0.0, 1.0) * MAX_DEPTH_MM
+
+def wrap_mm(x_mm: torch.Tensor, period_mm: float) -> torch.Tensor:
+    """예측 깊이(mm)를 주기(period_mm)로 랩핑. Cycle 일관성 계산용."""
+    return (x_mm % period_mm)
+
+def to_uint16_mm(x_mm: np.ndarray) -> np.ndarray:
+    """16-bit PNG 저장용 캐스팅."""
+    return np.clip(x_mm, 0, 65535).astype(np.uint16)
+
+def write_png_u16(path: Path, arr_mm: np.ndarray):
+    """16-bit mm PNG 저장(수치 보존)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    iio.imwrite(path.as_posix(), to_uint16_mm(arr_mm))
+
+# ── PhaseNet 2.0 스타일 시각화 유틸 ─────────────────────────────────────────
+def colorize_depth_mm(arr: np.ndarray, vmin=None, vmax=None, cmap='viridis') -> np.ndarray:
+    """
+    깊이(mm) → RGB(8-bit)로 컬러맵화.
+    - vmin/vmax를 고정하면 에폭/샘플 간 색 의미가 일정.
+    - 기본은 자동(min/max), 권장: 입력=0~AMBIG, GT/Pred=0~MAX_DEPTH_MM.
+    """
+    if vmin is None: vmin = float(np.nanmin(arr))
+    if vmax is None: vmax = float(np.nanmax(arr))
+    vmax = max(vmax, vmin + 1e-6)
+    t = np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0)
+    rgb = plt.get_cmap(cmap)(t)[..., :3]
+    return (rgb * 255).astype(np.uint8)
+# === (ADD) colorbar가 포함된 깊이 → RGB 저장 유틸 ===
+def save_depth_with_colorbar(arr_mm: np.ndarray, out_path: Path,
+                             vmin: float, vmax: float,
+                             cmap: str = 'jet', dpi: int = 220):
+    """
+    arr_mm : (H, W) 실수형 깊이(mm)
+    vmin/vmax : 컬러 스케일(mm). 입력은 0~AMBIG, GT/Pred는 0~MAX_DEPTH 권장
+    cmap   : 'jet' | 'viridis' | 'turbo' 등
+    """
+    h, w = arr_mm.shape
+    # 출력 해상도에 맞춰 figure 크기 자동 조정(너무 작지 않게)
+    fig_w = max(4.0, w / dpi)
+    fig_h = max(3.0, h / dpi)
+
+    fig = plt.figure(figsize=(fig_w, fig_h), dpi=dpi)
+    ax = fig.add_axes([0.01, 0.01, 0.80, 0.98])     # 오른쪽 colorbar 자리 확보
+    im = ax.imshow(arr_mm, cmap=cmap, vmin=vmin, vmax=vmax)
+    ax.axis('off')
+
+    cax = fig.add_axes([0.84, 0.05, 0.03, 0.9])
+    cbar = plt.colorbar(im, cax=cax)
+    cbar.set_label("Depth (mm)")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path.as_posix(), bbox_inches='tight', pad_inches=0.05)
+    plt.close(fig)
+
+def save_visuals_with_cb_like_phasenet(sample, pred_mm: torch.Tensor,
+                                       out_dir: Path, tag: str,
+                                       r_in_mm: float = AMBIG_MM,
+                                       max_depth_mm: float = MAX_DEPTH_MM,
+                                       cmap: str = 'jet'):
+    """
+    PhaseNet 2.0 스타일 파일명으로 colorbar 포함 RGB 저장
+    - *_in_wrapped_rgb_jet.png    : 입력(랩핑) [0, r_in_mm]
+    - *_gt_depth_rgb_jet.png      : GT        [0, max_depth_mm]
+    - *_pred_depth_rgb_jet.png    : 예측      [0, max_depth_mm]
+    - *_error_mm_rgb_jet.png      : |pred-gt| [0, err_max(99퍼센타일)]
+    - *_pred_depth_mm_u16.png     : 16-bit mm 원본(수치 보존)
+    """
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    x_mm = norm_to_mm(sample["x"]).cpu().numpy()   # [B,1,H,W]
+    y_mm = norm_to_mm(sample["y"]).cpu().numpy()
+    p_mm = pred_mm.detach().cpu().numpy()
+    names = sample["names"]
+
+    for i in range(p_mm.shape[0]):
+        stem = names[i].rsplit('.', 1)[0]
+
+        # 입력(랩핑) / GT / 예측
+        save_depth_with_colorbar(x_mm[i,0], out_dir / f"{tag}_{stem}_in_wrapped_rgb_jet.png",
+                                 vmin=0.0, vmax=r_in_mm, cmap=cmap)
+        save_depth_with_colorbar(y_mm[i,0], out_dir / f"{tag}_{stem}_gt_depth_rgb_jet.png",
+                                 vmin=0.0, vmax=max_depth_mm, cmap=cmap)
+        save_depth_with_colorbar(p_mm[i,0], out_dir / f"{tag}_{stem}_pred_depth_rgb_jet.png",
+                                 vmin=0.0, vmax=max_depth_mm, cmap=cmap)
+
+        # 에러(상한은 99퍼센타일로 클리핑해 과한 꼬리값 완화)
+        err = np.abs(p_mm[i,0] - y_mm[i,0])
+        emax = float(np.percentile(err, 99.0))
+        save_depth_with_colorbar(err, out_dir / f"{tag}_{stem}_error_mm_rgb_jet.png",
+                                 vmin=0.0, vmax=max(1.0, emax), cmap=cmap)
+
+        # 16-bit mm PNG (수치 보존)
+        write_png_u16(out_dir / f"{tag}_{stem}_pred_depth_mm_u16.png", p_mm[i,0])
+
+def save_visuals_like_phasenet(sample, pred_mm: torch.Tensor, out_dir: Path, tag: str,
+                               r_in_mm: float = AMBIG_MM, max_depth_mm: float = MAX_DEPTH_MM):
+    """
+    PhaseNet 2.0 코드와 동일한 파일 네이밍/구조로 저장.
+    - *_in_wrapped_rgb.png   : 입력(랩핑 깊이, 0~R_in)
+    - *_gt_depth_rgb.png     : GT(0~MAX_DEPTH)
+    - *_pred_depth_rgb.png   : 예측(0~MAX_DEPTH)
+    - *_error_mm_rgb.png     : |pred-gt| 색
+    - *_pred_depth_mm_u16.png: 예측 16-bit mm (수치 보존)
+    """
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    x_mm  = norm_to_mm(sample["x"]).cpu().numpy()  # [B,1,H,W]
+    y_mm  = norm_to_mm(sample["y"]).cpu().numpy()
+    p_mm  = pred_mm.detach().cpu().numpy()
+    stems = sample["names"]
+
+    B = p_mm.shape[0]
+    for i in range(B):
+        name = stems[i].rsplit('.', 1)[0]
+        in_rgb  = colorize_depth_mm(x_mm[i,0], vmin=0, vmax=r_in_mm)           # 랩핑 깊이 시각화
+        gt_rgb  = colorize_depth_mm(y_mm[i,0], vmin=0, vmax=max_depth_mm)
+        pred_rgb= colorize_depth_mm(p_mm[i,0], vmin=0, vmax=max_depth_mm)
+
+        err = np.abs(p_mm[i,0] - y_mm[i,0])
+        vmax_err = max(1.0, float(np.percentile(err, 99)))  # 꼬리값 완화
+        err_rgb = colorize_depth_mm(err, vmin=0, vmax=vmax_err)
+
+        plt.imsave(out_dir / f"{tag}_{name}_in_wrapped_rgb.png", in_rgb)
+        plt.imsave(out_dir / f"{tag}_{name}_gt_depth_rgb.png",   gt_rgb)
+        plt.imsave(out_dir / f"{tag}_{name}_pred_depth_rgb.png", pred_rgb)
+        plt.imsave(out_dir / f"{tag}_{name}_error_mm_rgb.png",   err_rgb)
+
+        write_png_u16(out_dir / f"{tag}_{name}_pred_depth_mm_u16.png", p_mm[i,0])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) 데이터셋 (기존 회귀 코드와 동일)
+# ─────────────────────────────────────────────────────────────────────────────
+SUPPORTED_EXT = {'.png', '.tif', '.tiff', '.npy'}
+
+class ToFDataset(Dataset):
+    def __init__(self, pairs: List[Tuple[Path, Path]], size: int = 256, is_train: bool = True):
+        self.pairs = pairs
+        self.size = size
+        self.is_train = is_train
+
+    def __len__(self): return len(self.pairs)
+
+    def _read1(self, p: Path) -> np.ndarray:
+        if p.suffix.lower() == '.npy':
+            arr = np.load(p.as_posix())
+        else:
+            arr = iio.imread(p.as_posix())
+        arr = np.asarray(arr)
+        if arr.ndim == 3:   # RGB라면 1채널 평균
+            arr = arr.mean(axis=2)
+        return arr.astype(np.float32)
+
+    def _resize(self, img: np.ndarray, size: int) -> np.ndarray:
+        t = torch.from_numpy(img).float().unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, size=(size, size), mode='bilinear', align_corners=False)
+        return t.squeeze(0).squeeze(0).numpy()
+
+    def __getitem__(self, idx: int):
+        p_in, p_gt = self.pairs[idx]
+        x = self._read1(p_in)  # mm
+        y = self._read1(p_gt)  # mm
+
+        x = self._resize(x, self.size)
+        y = self._resize(y, self.size)
+
+        if self.is_train:
+            if random.random() < 0.5:
+                x = np.flip(x, axis=1).copy(); y = np.flip(y, axis=1).copy()
+            if random.random() < 0.5:
+                x = np.flip(x, axis=0).copy(); y = np.flip(y, axis=0).copy()
+
+        x = np.clip(x, 0, MAX_DEPTH_MM)
+        y = np.clip(y, 0, MAX_DEPTH_MM)
+        x = (x / MAX_DEPTH_MM).astype(np.float32)
+        y = (y / MAX_DEPTH_MM).astype(np.float32)
+
+        x = torch.from_numpy(x).unsqueeze(0)  # [1,H,W]
+        y = torch.from_numpy(y).unsqueeze(0)
+        return {"x": x, "y": y, "names": p_in.name}
+
+def build_pairs(input_dir: Path, gt_dir: Path) -> List[Tuple[Path, Path]]:
+    ins = {}
+    for p in input_dir.iterdir():
+        if p.suffix.lower() in SUPPORTED_EXT:
+            ins[p.stem] = p
+    pairs = []
+    for p in gt_dir.iterdir():
+        if p.suffix.lower() in SUPPORTED_EXT and p.stem in ins:
+            pairs.append((ins[p.stem], p))
+    pairs.sort(key=lambda t: t[0].stem)
+    return pairs
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) 네트워크 (기존 회귀 코드와 동일: 경량 U-Net)
+# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────
+# Res-UNet (Residual U-Net) — 회귀 1채널(sigmoid) 출력
+#   - 다운/업샘플은 U-Net 형태
+#   - 각 스테이지는 ResidualBlock(2×3x3 Conv + 스킵)
+#   - 스킵은 인코더-디코더 간 concat
+#   - 출력은 [0,1] 정규화(depth_norm) → 외부에서 mm 복원(norm_to_mm)
+# ─────────────────────────────────────────────────────────
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ResidualBlock(nn.Module):
+    """표준 ResBlock: Conv-BN-ReLU-Conv-BN + skip (채널/stride 안맞으면 1x1로 맞춤)"""
+    def __init__(self, ci, co, stride=1, norm='bn', act='relu'):
+        super().__init__()
+        Norm = nn.BatchNorm2d if norm == 'bn' else nn.InstanceNorm2d
+        self.conv1 = nn.Conv2d(ci, co, 3, stride=stride, padding=1, bias=False)
+        self.n1    = Norm(co)
+        self.conv2 = nn.Conv2d(co, co, 3, stride=1, padding=1, bias=False)
+        self.n2    = Norm(co)
+        self.act   = nn.ReLU(inplace=True) if act == 'relu' else nn.LeakyReLU(0.1, inplace=True)
+        self.skip  = nn.Identity() if (ci == co and stride == 1) else nn.Conv2d(ci, co, 1, stride=stride, bias=False)
+
+    def forward(self, x):
+        y = self.act(self.n1(self.conv1(x)))
+        y = self.n2(self.conv2(y))
+        s = self.skip(x)
+        return self.act(y + s)
+
+class UpBlock(nn.Module):
+    """ConvTranspose2d로 2배 업샘플 + (concat skip) + ResidualBlock"""
+    def __init__(self, ci, co, norm='bn', act='relu'):
+        super().__init__()
+        self.up   = nn.ConvTranspose2d(ci, co, 2, stride=2)
+        self.conv = ResidualBlock(ci=co*2, co=co, stride=1, norm=norm, act=act)  # concat 후 채널=co*2
+    def forward(self, x, skip):
+        x = self.up(x)
+        # 공간 크기 미세 오차 보정(짝수/홀수에서 1픽셀 차이 날 수 있음)
+        if x.shape[-1] != skip.shape[-1] or x.shape[-2] != skip.shape[-2]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+class ResUNetReg(nn.Module):
+    """
+    base_ch=48이면, 인코더 채널: 48→96→192 (2단 다운), bottleneck=384
+    """
+    def __init__(self, in_ch=1, base_ch=48, norm='bn', act='relu', n_down=2):
+        super().__init__()
+        ch1 = base_ch           # 48
+        ch2 = base_ch * 2       # 96
+        ch3 = base_ch * 4       # 192
+        chb = base_ch * 8       # 384
+
+        # Encoder
+        self.enc1 = ResidualBlock(in_ch, ch1, stride=1, norm=norm, act=act)  # /1
+        self.down1= ResidualBlock(ch1, ch2, stride=2, norm=norm, act=act)    # /2
+        self.enc2 = ResidualBlock(ch2, ch2, stride=1, norm=norm, act=act)    # /2
+        self.down2= ResidualBlock(ch2, ch3, stride=2, norm=norm, act=act)    # /4
+
+        # Bottleneck
+        self.bott = ResidualBlock(ch3, chb, stride=2, norm=norm, act=act)    # /8
+
+        # Decoder
+        self.up2  = UpBlock(chb, ch3, norm=norm, act=act)   # -> /4
+        self.up1  = UpBlock(ch3, ch2, norm=norm, act=act)   # -> /2
+        self.up0  = nn.ConvTranspose2d(ch2, ch1, 2, stride=2)  # -> /1
+        self.dec0 = ResidualBlock(ch1, ch1, stride=1, norm=norm, act=act)
+
+        # Head: 1x1 conv → sigmoid
+        self.head = nn.Conv2d(ch1, 1, 1)
+
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)           # [B, c1, H,   W  ]
+        d1 = self.down1(e1)         # [B, c2, H/2, W/2]
+        e2 = self.enc2(d1)          # [B, c2, H/2, W/2]
+        d2 = self.down2(e2)         # [B, c3, H/4, W/4]
+
+        b  = self.bott(d2)          # [B, cb, H/8, W/8]
+
+        # Decoder
+        u2 = self.up2(b,  d2)       # [B, c3, H/4, W/4]
+        u1 = self.up1(u2, e2)       # [B, c2, H/2, W/2]
+        u0 = self.up0(u1)           # [B, c1, H,   W  ]
+        if u0.shape[-2:] != e1.shape[-2:]:
+            u0 = F.interpolate(u0, size=e1.shape[-2:], mode='bilinear', align_corners=False)
+        z  = self.dec0(u0 + e1)     # 마지막에도 residual 접합으로 안정화
+
+        y  = torch.sigmoid(self.head(z))  # [B,1,H,W] (정규화)
+        return y
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) 손실 (기존 회귀 코드: L1 + Gradient + Cycle + SSIM)
+# ─────────────────────────────────────────────────────────────────────────────
+class Sobel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        kx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32)
+        ky = torch.tensor([[-1,-2,-1],[0,0,0],[1,2,1]], dtype=torch.float32)
+        self.register_buffer('kx', kx.view(1,1,3,3))
+        self.register_buffer('ky', ky.view(1,1,3,3))
+    def forward(self, x):
+        gx = F.conv2d(x, self.kx, padding=1)
+        gy = F.conv2d(x, self.ky, padding=1)
+        return gx, gy
+
+def ssim_1ch(x: torch.Tensor, y: torch.Tensor, C1: float = 0.01**2, C2: float = 0.03**2) -> torch.Tensor:
+    """간단 SSIM(정규화 도메인)."""
+    def gaussian_window(ch: int, ksize: int = 11, sigma: float = 1.5, device="cpu", dtype=torch.float32):
+        ax = torch.arange(ksize, dtype=dtype, device=device) - (ksize - 1) / 2
+        gauss = torch.exp(-(ax**2) / (2 * sigma**2)); gauss = (gauss / gauss.sum()).unsqueeze(0)
+        w = (gauss.t() @ gauss).unsqueeze(0).unsqueeze(0)
+        return w.expand(ch, 1, ksize, ksize).contiguous()
+    ch = x.size(1)
+    w = gaussian_window(ch, device=x.device, dtype=x.dtype)
+    mu_x = F.conv2d(x, w, padding=5, groups=ch); mu_y = F.conv2d(y, w, padding=5, groups=ch)
+    sigma_x = F.conv2d(x*x, w, padding=5, groups=ch) - mu_x*mu_x
+    sigma_y = F.conv2d(y*y, w, padding=5, groups=ch) - mu_y*mu_y
+    sigma_xy= F.conv2d(x*y, w, padding=5, groups=ch) - mu_x*mu_y
+    ssim_map = ((2*mu_x*mu_y + C1)*(2*sigma_xy + C2))/((mu_x**2+mu_y**2 + C1)*(sigma_x + sigma_y + C2))
+    return ssim_map.mean()
+
+class CombinedLoss(nn.Module):
+    """L1 + Gradient + Cycle(랩 일치) + SSIM(보조): 기존과 동일"""
+    def __init__(self, w_l1=1.0, w_grad=0.1, w_cyc=0.5, w_ssim=0.1):
+        super().__init__()
+        self.w_l1=w_l1; self.w_grad=w_grad; self.w_cyc=w_cyc; self.w_ssim=w_ssim
+        self.sobel = Sobel()
+    def forward(self, pred_n: torch.Tensor, gt_n: torch.Tensor, inp_n: torch.Tensor):
+        l1 = F.l1_loss(pred_n, gt_n)
+        gx_p, gy_p = self.sobel(pred_n); gx_g, gy_g = self.sobel(gt_n)
+        l_grad = (F.l1_loss(gx_p, gx_g) + F.l1_loss(gy_p, gy_g)) * 0.5
+        pred_mm = norm_to_mm(pred_n); inp_mm = norm_to_mm(inp_n)
+        l_cyc = F.l1_loss((pred_mm % AMBIG_MM)/MAX_DEPTH_MM, (inp_mm % AMBIG_MM)/MAX_DEPTH_MM)
+        ssim = ssim_1ch(pred_n, gt_n); l_ssim = 1.0 - ssim
+        total = self.w_l1*l1 + self.w_grad*l_grad + self.w_cyc*l_cyc + self.w_ssim*l_ssim
+        return total, {"l1":l1.item(), "grad":l_grad.item(), "cyc":l_cyc.item(), "ssim": ssim.item()}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) 학습/평가 루프 (기존 회귀 코드 유지) + 시각화만 PhaseNet 스타일 추가
+# ─────────────────────────────────────────────────────────────────────────────
+def psnr_mm(pred_mm: torch.Tensor, gt_mm: torch.Tensor, max_val_mm: float = MAX_DEPTH_MM) -> float:
+    mse = torch.mean((pred_mm - gt_mm) ** 2)
+    if mse.item() == 0: return 99.0
+    return (10.0 * torch.log10((max_val_mm ** 2) / mse)).item()
+
+def evaluate(model: nn.Module, loader: DataLoader) -> Dict[str, float]:
+    model.eval()
+    mae = 0.0; mse = 0.0; ssim_val = 0.0; psnr_val = 0.0; n = 0
+    eps = 1e-12
+    with torch.no_grad():
+        for batch in loader:
+            x = batch["x"].to(DEVICE)      # 정규화 [0,1]
+            y = batch["y"].to(DEVICE)      # 정규화 [0,1]
+            p = model(x)                   # 정규화 [0,1]
+            p_mm = norm_to_mm(p)           # mm
+            y_mm = norm_to_mm(y)           # mm
+            x_mm = norm_to_mm(x)           # mm (입력도 mm로 복원)
+
+            # ▶ 유효 마스크: 0/65535 무효, 음수 무효(안정)
+            valid = (y_mm > 0) & (y_mm < 65535) & (x_mm > 0) & (x_mm < 65535)
+            if valid.sum() == 0:
+                continue
+
+            diff = (p_mm - y_mm)[valid]
+            mae += diff.abs().mean().item()
+            mse_loc = (diff**2).mean().item()
+            mse += mse_loc
+
+            # PSNR (peak=MAX_DEPTH_MM 고정)
+            psnr_val += 10.0 * math.log10((MAX_DEPTH_MM**2) / (mse_loc + eps))
+
+            # SSIM은 정규화 도메인에서 (마스크 없이) 계산 유지 or 필요시 마스크 적용
+            ssim_val += ssim_1ch(p, y).item()
+            n += 1
+
+    mae /= max(1, n); mse /= max(1, n); rmse = math.sqrt(mse); ssim_val /= max(1, n); psnr_val /= max(1, n)
+    return {'MAE': mae, 'MSE': mse, 'RMSE': rmse, 'SSIM': ssim_val, 'PSNR': psnr_val}
+
+
+def train_epoch(model, loader, opt, loss_fn):
+    model.train()
+    logs_acc = {"loss":0.0,"l1":0.0,"grad":0.0,"cyc":0.0,"ssim":0.0}; nstep=0
+    for batch in loader:
+        x = batch["x"].to(DEVICE); y = batch["y"].to(DEVICE)
+        pred = model(x)
+        loss, logs = loss_fn(pred, y, x)
+        opt.zero_grad(); loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 폭주 방지
+        opt.step()
+        logs_acc["loss"] += loss.item()
+        for k in ("l1","grad","cyc","ssim"): logs_acc[k] += logs[k]
+        nstep += 1
+    for k in logs_acc: logs_acc[k] /= max(1, nstep)
+    return logs_acc
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6) 실행(PhaseNet 2.0 스타일 저장 구조)
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    set_seed(SEED)
+    SAVE_ROOT.mkdir(parents=True, exist_ok=True)
+    RUN_DIR = SAVE_ROOT / f"run_{now_tag()}"
+    SUB = {"ckpt": RUN_DIR/"checkpoints", "viz": RUN_DIR/"viz", "pred": RUN_DIR/"pred", "logs": RUN_DIR/"logs"}
+    for p in SUB.values(): p.mkdir(parents=True, exist_ok=True)
+
+    print(f"[INFO] DEVICE={DEVICE}, torch={torch.__version__}")
+    print(f"[PATH] INPUT_DIR={INPUT_DIR}")
+    print(f"[PATH] GT_DIR   ={GT_DIR}")
+    print(f"[PATH] RUN_DIR  ={RUN_DIR}")
+
+    # 페어 구성 및 분할
+    pairs = build_pairs(INPUT_DIR, GT_DIR)
+    assert len(pairs) > 0, "입력/GT 파일을 찾지 못했습니다."
+    random.Random(SEED).shuffle(pairs)
+    n_val = int(round(len(pairs) * VAL_SPLIT))
+    val_pairs = pairs[:n_val]; train_pairs = pairs[n_val:]
+    print(f"[INFO] total={len(pairs)}, train={len(train_pairs)}, val={len(val_pairs)} (8:2)")
+
+    ds_tr = ToFDataset(train_pairs, size=INPUT_SIZE, is_train=True)
+    ds_va = ToFDataset(val_pairs,   size=INPUT_SIZE, is_train=False)
+    dl_tr = DataLoader(ds_tr, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+    dl_va = DataLoader(ds_va, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+    # 모델/최적화/손실
+    model = ResUNetReg(
+    in_ch=1,
+    base_ch=48,   # 메모리 여유 없으면 32, 더 강하게 가려면 64
+    norm='bn',
+    act='relu'
+).to(DEVICE)
+
+    opt   = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    sch   = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='min', factor=0.5, patience=5, threshold=1e-4, cooldown=0, min_lr=1e-7)
+    loss_fn = CombinedLoss(w_l1=1.0, w_grad=0.1, w_cyc=0.5, w_ssim=0.1).to(DEVICE)
+
+    best_rmse = 1e9
+    all_logs = {"train":[], "val":[], "best":None}
+
+    # ── 학습 루프 ───────────────────────────────────────────
+    for ep in range(1, EPOCHS+1):
+        tr = train_epoch(model, dl_tr, opt, loss_fn)
+        va = evaluate(model, dl_va)
+        sch.step(va["RMSE"])
+
+        print(f"[Epoch {ep:03d}] train: loss={tr['loss']:.4f}, L1={tr['l1']:.4f}, Grad={tr['grad']:.4f}, Cyc={tr['cyc']:.4f}, SSIM={tr['ssim']:.4f} | "
+              f"val: RMSE={va['RMSE']:.3f}, MAE={va['MAE']:.3f}, PSNR={va['PSNR']:.2f}dB, SSIM={va['SSIM']:.4f}")
+
+        all_logs["train"].append(tr); all_logs["val"].append(va)
+
+        # 베스트 체크포인트 저장
+        if va["RMSE"] < best_rmse:
+            best_rmse = va["RMSE"]
+            torch.save({"epoch": ep, "model": model.state_dict(), "metrics": va}, SUB["ckpt"]/ "best.pt")
+            print(f"[SAVE] best @ epoch {ep} (RMSE={best_rmse:.3f})")
+
+        # ── (핵심) PhaseNet 2.0 스타일 시각화: 검증 배치 일부 저장 ──
+        with torch.no_grad():
+            try:
+                sample = next(iter(dl_va))
+            except StopIteration:
+                sample = None
+            if sample is not None:
+                x = sample["x"].to(DEVICE)
+                p = model(x)
+                p_mm = norm_to_mm(p)
+                save_visuals_with_cb_like_phasenet(sample, p_mm, SUB["viz"], f"val_ep{ep:03d}",
+                                   r_in_mm=AMBIG_MM, max_depth_mm=MAX_DEPTH_MM, cmap='jet')
+
+        # 로그 파일
+        with open(SUB["logs"]/ "logs.json", "w", encoding="utf-8") as f:
+            json.dump(all_logs, f, indent=2, ensure_ascii=False)
+
+    print("[DONE] Training finished.")
+
+    # ── 베스트로 한 번 더 시각화/예측 저장(검증 전체) ─────────────────────
+    ckpt = torch.load(SUB["ckpt"]/ "best.pt", map_location=DEVICE)
+    model.load_state_dict(ckpt["model"]); model.eval()
+
+    with torch.no_grad():
+        for batch in dl_va:
+            x = batch["x"].to(DEVICE)
+            p = model(x); p_mm = norm_to_mm(p)
+            # viz 폴더에도 저장하고,
+            
+            save_visuals_with_cb_like_phasenet(batch, p_mm, SUB["viz"], "val_best",
+                                   r_in_mm=AMBIG_MM, max_depth_mm=MAX_DEPTH_MM, cmap='jet')
+
+
+            for i in range(p_mm.shape[0]):
+                name = batch["names"][i].rsplit('.',1)[0]
+                write_png_u16(SUB["pred"]/ f"{name}_pred_depth_mm_u16.png", p_mm[i,0].cpu().numpy())
+
+    print(f"[DONE] Results saved to: {RUN_DIR}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 엔트리포인트
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print(f"[INFO] DEVICE={DEVICE}, torch={torch.__version__}")
+    print(f"[PATH] INPUT_DIR={INPUT_DIR}")
+    print(f"[PATH] GT_DIR   ={GT_DIR}")
+    print(f"[PATH] SAVE_ROOT={SAVE_ROOT}")
+    main()
